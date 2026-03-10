@@ -1,3 +1,52 @@
+import sys
+import subprocess
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TỰ ĐỘNG CÀI ĐẶT THƯ VIỆN CẦN THIẾT
+# ═════════════════════════════════════════════════════════════════════════════
+
+REQUIRED_PACKAGES = {
+    "telegram":         "python-telegram-bot",
+    "nacl":             "pynacl",
+    "requests":         "requests",
+    "winrm":            "pywinrm",
+    "firebase_admin":   "firebase-admin",
+}
+
+def install_package(pip_name: str):
+    print(f"📦 Đang cài: {pip_name} ...")
+    result = subprocess.run(
+        [sys.executable, "-m", "pip", "install", pip_name, "--quiet"],
+        capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        print(f"  ✅ Cài thành công: {pip_name}")
+    else:
+        print(f"  ⚠️  Lỗi khi cài {pip_name}: {result.stderr.strip()}")
+
+def auto_install():
+    missing = []
+    for module, pip_name in REQUIRED_PACKAGES.items():
+        try:
+            __import__(module)
+        except ImportError:
+            missing.append(pip_name)
+
+    if missing:
+        print("🔍 Phát hiện thư viện chưa được cài đặt:")
+        for pkg in missing:
+            print(f"   • {pkg}")
+        print()
+        for pkg in missing:
+            install_package(pkg)
+        print("\n✅ Hoàn tất cài đặt! Đang khởi động bot...\n")
+    else:
+        print("✅ Tất cả thư viện đã được cài đặt.\n")
+
+auto_install()
+
+# ═════════════════════════════════════════════════════════════════════════════
+
 import os
 import zipfile
 import io
@@ -1576,8 +1625,4 @@ def main():
 
 
 if __name__ == '__main__':
-    try:
-        import telegram
-    except ImportError:
-        os.system("pip install python-telegram-bot pynacl requests pywinrm")
     main()

@@ -47,7 +47,7 @@ user_data = {}
 active_sessions = {}
 remote_sessions = {}
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8144164500:AAGkXMEbjc3PMUtnQMDVVtace8medq-otjY")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "7000771103:AAGttf2jhIYuaT5063iabVwZsA4isgE-LLw")
 ADMIN_ID  = 5738766741
 
 NORMAL_MIN = 60
@@ -1479,3 +1479,4 @@ if __name__ == '__main__':
     except ImportError:
         os.system("pip install python-telegram-bot pynacl requests pywinrm")
     main()
+

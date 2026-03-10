@@ -1,5 +1,3 @@
-#test
-
 import os
 import zipfile
 import io
@@ -760,7 +758,7 @@ async def do_delete_repo(loop, github_token: str, username: str,
             logger.info(f"Repo {repo_name} deleted")
             await bot.send_message(
                 chat_id=user_id,
-                text="🗑️ Repo GitHub đã được xóa tự động để bảo mật.")
+                text="Xong")
         else:
             logger.warning(f"Delete repo failed: {r.status_code}")
     except Exception as e:

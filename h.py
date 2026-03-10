@@ -6,6 +6,9 @@ import base64
 import time
 import logging
 import re
+import threading
+import tempfile
+import json
 from datetime import datetime, timezone
 from typing import Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -17,36 +20,339 @@ from nacl import encoding, public
 import secrets
 import string
 
+# ── Firebase Admin SDK ────────────────────────────────────────────────────────
+try:
+    import firebase_admin
+    from firebase_admin import credentials, db as firebase_db
+    FIREBASE_AVAILABLE = True
+except ImportError:
+    FIREBASE_AVAILABLE = False
+
+# ── Cố gắng import winrm (tuỳ chọn) ─────────────────────────────────────────
+try:
+    import winrm
+    WINRM_AVAILABLE = True
+except ImportError:
+    WINRM_AVAILABLE = False
+
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
                     level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 GITHUB_TOKEN_STATE, TAILSCALE_KEY_STATE, TAILSCALE_API_STATE, DURATION_STATE, CONFIRM_STATE = range(5)
+REMOTE_IP_STATE, REMOTE_USER_STATE, REMOTE_PASS_STATE = range(5, 8)
 
 # ── Lưu trạng thái người dùng ────────────────────────────────────────────────
-user_data = {}          # Dữ liệu tạm trong conversation
-active_sessions = {}    # {user_id: {'expire_at': timestamp, 'duration_display': str, 'run_id': int, ...}}
+user_data = {}
+active_sessions = {}
+remote_sessions = {}
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "7000771103:AAGttf2jhIYuaT5063iabVwZsA4isgE-LLw")
-ADMIN_ID = 5738766741   # Admin được phép dùng 15p - 6h
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8144164500:AAGkXMEbjc3PMUtnQMDVVtace8medq-otjY")
+ADMIN_ID  = 5738766741
 
-# ── Giới hạn thời gian ───────────────────────────────────────────────────────
-NORMAL_MIN = 60    # phút
-NORMAL_MAX = 180   # phút
-ADMIN_MIN  = 15    # phút
-ADMIN_MAX  = 360   # phút
+NORMAL_MIN = 60
+NORMAL_MAX = 180
+ADMIN_MIN  = 15
+ADMIN_MAX  = 360
+
+BOT_FILE_URL = "https://raw.githubusercontent.com/phuctrongytb16-ctrl/Win11/main/h.py"
+
+# ── Firebase Configuration ────────────────────────────────────────────────────
+FIREBASE_CONFIG = {
+    "apiKey": "AIzaSyAJh6-2mxzFADaA_qNlw-MAXZ_wc9zgKL4",
+    "authDomain": "sever-login-ae5cc.firebaseapp.com",
+    "databaseURL": "https://sever-login-ae5cc-default-rtdb.firebaseio.com",
+    "projectId": "sever-login-ae5cc",
+    "storageBucket": "sever-login-ae5cc.firebasestorage.app",
+    "messagingSenderId": "966951494514",
+    "appId": "1:966951494514:web:2663ca6c5814108716b3eb",
+    "measurementId": "G-6C22LDBYGK"
+}
+
+FIREBASE_DB_URL = FIREBASE_CONFIG["databaseURL"]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# FIREBASE HELPERS — Dùng REST API (không cần service account)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def firebase_get(path: str) -> Optional[dict]:
+    """Lấy dữ liệu từ Firebase Realtime Database qua REST."""
+    try:
+        url = f"{FIREBASE_DB_URL}/{path}.json"
+        r = requests.get(url, timeout=10)
+        if r.status_code == 200:
+            return r.json()
+    except Exception as e:
+        logger.error(f"Firebase GET error ({path}): {e}")
+    return None
+
+
+def firebase_set(path: str, data: dict) -> bool:
+    """Ghi dữ liệu lên Firebase Realtime Database qua REST."""
+    try:
+        url = f"{FIREBASE_DB_URL}/{path}.json"
+        r = requests.put(url, json=data, timeout=10)
+        return r.status_code == 200
+    except Exception as e:
+        logger.error(f"Firebase SET error ({path}): {e}")
+    return False
+
+
+def firebase_delete(path: str) -> bool:
+    """Xóa dữ liệu khỏi Firebase Realtime Database qua REST."""
+    try:
+        url = f"{FIREBASE_DB_URL}/{path}.json"
+        r = requests.delete(url, timeout=10)
+        return r.status_code == 200
+    except Exception as e:
+        logger.error(f"Firebase DELETE error ({path}): {e}")
+    return False
+
+
+def save_rdp_to_firebase(user_id: int, username_tg: str, ip: str,
+                          rdp_user: str, rdp_pass: str,
+                          duration_minutes: int, start_ts: float) -> bool:
+    """Lưu thông tin RDP lên Firebase."""
+    expire_ts = start_ts + duration_minutes * 60
+    data = {
+        "user_id":          user_id,
+        "username_telegram": username_tg,
+        "ip":               ip,
+        "rdp_user":         rdp_user,
+        "rdp_pass":         rdp_pass,
+        "duration_minutes": duration_minutes,
+        "created_at":       datetime.fromtimestamp(start_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "expires_at":       datetime.fromtimestamp(expire_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "created_ts":       start_ts,
+        "expires_ts":       expire_ts,
+        "status":           "active"
+    }
+    return firebase_set(f"rdp_sessions/{user_id}", data)
+
+
+def get_rdp_from_firebase(user_id: int) -> Optional[dict]:
+    """Lấy thông tin RDP của user từ Firebase."""
+    return firebase_get(f"rdp_sessions/{user_id}")
+
+
+def mark_rdp_expired_firebase(user_id: int) -> bool:
+    """Đánh dấu RDP đã hết hạn trên Firebase."""
+    data = firebase_get(f"rdp_sessions/{user_id}")
+    if data:
+        data["status"] = "expired"
+        return firebase_set(f"rdp_sessions/{user_id}", data)
+    return False
+
+
+def check_user_has_active_rdp_firebase(user_id: int) -> Optional[dict]:
+    """
+    Kiểm tra user có RDP đang active trên Firebase không.
+    Trả về dict nếu còn hạn, None nếu không.
+    """
+    data = firebase_get(f"rdp_sessions/{user_id}")
+    if not data:
+        return None
+    if data.get("status") != "active":
+        return None
+    expire_ts = data.get("expires_ts", 0)
+    if time.time() < expire_ts:
+        return data
+    # Hết hạn → cập nhật status
+    mark_rdp_expired_firebase(user_id)
+    return None
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# WINRM — KẾT NỐI MÁY ẢO KHÁC
+# ═════════════════════════════════════════════════════════════════════════════
+
+def winrm_connect(ip: str, username: str, password: str):
+    if not WINRM_AVAILABLE:
+        return None
+    try:
+        session = winrm.Session(
+            f'http://{ip}:5985/wsman',
+            auth=(username, password),
+            transport='ntlm'
+        )
+        r = session.run_cmd('echo', ['OK'])
+        if r.status_code == 0:
+            return session
+    except Exception as e:
+        logger.error(f"WinRM connect error: {e}")
+    return None
+
+
+def winrm_run_bot(session, username: str, file_url: str) -> dict:
+    remote_path = f"C:\\Users\\{username}\\h.py"
+    results = {}
+    try:
+        dl_cmd = f'curl -L {file_url} -o {remote_path}'
+        r = session.run_cmd("cmd", ["/c", dl_cmd])
+        results['download'] = {
+            'stdout': r.std_out.decode(errors='replace'),
+            'stderr': r.std_err.decode(errors='replace'),
+            'ok': r.status_code == 0
+        }
+        time.sleep(3)
+
+        r = session.run_cmd("cmd", ["/c",
+            "python -m pip install python-telegram-bot pynacl requests pywin32 pillow"])
+        results['install'] = {
+            'stdout': r.std_out.decode(errors='replace'),
+            'stderr': r.std_err.decode(errors='replace'),
+            'ok': r.status_code == 0
+        }
+        time.sleep(3)
+
+        r = session.run_cmd("cmd", ["/c",
+            f"start cmd /k python {remote_path}"])
+        results['run'] = {
+            'stdout': r.std_out.decode(errors='replace'),
+            'ok': r.status_code == 0
+        }
+    except Exception as e:
+        results['error'] = str(e)
+    return results
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# /connect — Lệnh kết nối máy ảo từ xa
+# ═════════════════════════════════════════════════════════════════════════════
+
+async def connect_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not WINRM_AVAILABLE:
+        await update.message.reply_text(
+            "⚠️ Thư viện <code>pywinrm</code> chưa được cài.\n"
+            "Chạy: <code>pip install pywinrm</code>",
+            parse_mode='HTML')
+        return ConversationHandler.END
+
+    user_id = update.effective_user.id
+    user_data[user_id] = {'_connect': True}
+    await update.message.reply_text(
+        "╔══════════════════════════╗\n"
+        "║  🔌  KẾT NỐI MÁY TỪ XA  ║\n"
+        "╚══════════════════════════╝\n\n"
+        "📍 <b>Bước 1/3</b> — Nhập địa chỉ IP:",
+        parse_mode='HTML')
+    return REMOTE_IP_STATE
+
+
+async def get_remote_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    ip = update.message.text.strip()
+    if not re.match(r'^\d+\.\d+\.\d+\.\d+$', ip):
+        await update.message.reply_text("❌ IP không hợp lệ. Vui lòng nhập lại:")
+        return REMOTE_IP_STATE
+    user_data[user_id]['remote_ip'] = ip
+    await update.message.reply_text(
+        f"✅ IP đã nhận: <code>{ip}</code>\n\n"
+        "📍 <b>Bước 2/3</b> — Nhập Username:",
+        parse_mode='HTML')
+    return REMOTE_USER_STATE
+
+
+async def get_remote_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user_data[user_id]['remote_username'] = update.message.text.strip()
+    await update.message.reply_text(
+        "✅ Username đã nhận!\n\n"
+        "📍 <b>Bước 3/3</b> — Nhập Password:",
+        parse_mode='HTML')
+    return REMOTE_PASS_STATE
+
+
+async def get_remote_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    password = update.message.text.strip()
+    ip       = user_data[user_id]['remote_ip']
+    username = user_data[user_id]['remote_username']
+
+    msg = await update.message.reply_text(
+        "🔄 Đang thiết lập kết nối, vui lòng chờ...")
+
+    loop = asyncio.get_running_loop()
+    session = await loop.run_in_executor(None, lambda: winrm_connect(ip, username, password))
+
+    if not session:
+        await msg.edit_text(
+            "╔══════════════════════════╗\n"
+            "║  ❌  KẾT NỐI THẤT BẠI   ║\n"
+            "╚══════════════════════════╝\n\n"
+            "Vui lòng kiểm tra:\n"
+            "• Địa chỉ IP\n"
+            "• Thông tin đăng nhập\n"
+            "• WinRM đã được bật chưa\n\n"
+            "Dùng /connect để thử lại.")
+        user_data.pop(user_id, None)
+        return ConversationHandler.END
+
+    remote_sessions[user_id] = {
+        'ip': ip, 'username': username, 'password': password, 'session': session
+    }
+
+    await msg.edit_text(
+        "╔══════════════════════════════╗\n"
+        "║  ✅  KẾT NỐI THÀNH CÔNG!    ║\n"
+        "╚══════════════════════════════╝\n\n"
+        f"🖥️ IP       : <code>{ip}</code>\n"
+        f"👤 Username : <code>{username}</code>\n\n"
+        "🤖 Đang triển khai bot trên máy từ xa...",
+        parse_mode='HTML')
+
+    asyncio.create_task(run_remote_bot_task(context.bot, user_id, session, username))
+    user_data.pop(user_id, None)
+    return ConversationHandler.END
+
+
+async def run_remote_bot_task(bot, user_id: int, session, username: str):
+    loop = asyncio.get_running_loop()
+    try:
+        results = await loop.run_in_executor(None, lambda:
+            winrm_run_bot(session, username, BOT_FILE_URL))
+
+        dl  = results.get('download', {})
+        ins = results.get('install', {})
+        run = results.get('run', {})
+        err = results.get('error', '')
+
+        if err:
+            text = (
+                "╔══════════════════════════╗\n"
+                "║  ❌  LỖI TRIỂN KHAI BOT  ║\n"
+                "╚══════════════════════════╝\n\n"
+                f"Chi tiết: <code>{err}</code>"
+            )
+        else:
+            def status_icon(ok): return "✅" if ok else "❌"
+            text = (
+                "╔══════════════════════════════╗\n"
+                "║  📋  KẾT QUẢ TRIỂN KHAI BOT  ║\n"
+                "╚══════════════════════════════╝\n\n"
+                f"{status_icon(dl.get('ok'))}  Tải file bot\n"
+                f"{status_icon(ins.get('ok'))}  Cài thư viện\n"
+                f"{status_icon(run.get('ok'))}  Khởi chạy bot\n\n"
+                "💡 Bot đã được kích hoạt trên máy từ xa."
+            )
+
+        await bot.send_message(chat_id=user_id, text=text, parse_mode='HTML')
+    except Exception as e:
+        logger.error(f"Remote bot task error: {e}")
+        await bot.send_message(chat_id=user_id,
+                               text=f"❌ Lỗi khi triển khai bot: <code>{e}</code>",
+                               parse_mode='HTML')
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ═════════════════════════════════════════════════════════════════════════════
 
 def generate_password(length=14) -> str:
-    """Password chỉ gồm chữ hoa, chữ thường, số — không ký tự đặc biệt."""
     upper  = string.ascii_uppercase
     lower  = string.ascii_lowercase
     digits = string.digits
-    # Đảm bảo có ít nhất 2 ký tự mỗi loại
     pwd = [
         secrets.choice(upper),  secrets.choice(upper),
         secrets.choice(lower),  secrets.choice(lower),
@@ -59,10 +365,8 @@ def generate_password(length=14) -> str:
 
 
 def generate_username() -> str:
-    """Sinh username random dạng UserXXXXXX (chữ + số, bắt đầu bằng chữ)."""
-    prefix = "User"
     suffix = ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(6))
-    return prefix + suffix
+    return "User" + suffix
 
 
 def encrypt_secret(public_key: str, secret_value: str) -> str:
@@ -73,12 +377,6 @@ def encrypt_secret(public_key: str, secret_value: str) -> str:
 
 
 def parse_duration(text: str, user_id: int = 0) -> Optional[tuple]:
-    """
-    Parse chuỗi thời gian: 1h, 2h30p, 1h26p, 90p, 15p, 6h, v.v.
-    Admin (ADMIN_ID): 15p – 6h
-    Người thường     : 1h  – 3h
-    Trả về (total_minutes, display_string) hoặc None nếu không hợp lệ.
-    """
     is_admin = (user_id == ADMIN_ID)
     min_m = ADMIN_MIN  if is_admin else NORMAL_MIN
     max_m = ADMIN_MAX  if is_admin else NORMAL_MAX
@@ -119,17 +417,28 @@ def parse_duration(text: str, user_id: int = 0) -> Optional[tuple]:
 
 
 def format_remaining(seconds: float) -> str:
-    """Chuyển số giây còn lại thành chuỗi dễ đọc."""
     if seconds <= 0:
         return "Đã hết hạn"
     m, s = divmod(int(seconds), 60)
     h, m = divmod(m, 60)
     if h > 0:
-        return f"{h}h {m}p {s}s"
+        return f"{h}h {m:02d}p {s:02d}s"
     elif m > 0:
-        return f"{m}p {s}s"
+        return f"{m}p {s:02d}s"
     else:
         return f"{s}s"
+
+
+def format_datetime_vn(ts: float) -> str:
+    """Định dạng timestamp sang giờ Việt Nam (UTC+7)."""
+    dt = datetime.fromtimestamp(ts + 7 * 3600, tz=timezone.utc)
+    return dt.strftime("%H:%M:%S %d/%m/%Y")
+
+
+def create_progress_bar(percent: int, length: int = 12) -> str:
+    filled = int(percent / 100 * length)
+    bar = "▰" * filled + "▱" * (length - filled)
+    return bar
 
 
 def create_workflow_content(random_password: str, duration_minutes: int, rdp_username: str) -> str:
@@ -247,13 +556,6 @@ def get_latest_run(token: str, username: str, repo: str) -> Optional[dict]:
     return d['workflow_runs'][0] if d['total_count'] > 0 else None
 
 
-def get_run_by_id(token: str, username: str, repo: str, run_id: int) -> Optional[dict]:
-    r = requests.get(
-        f'https://api.github.com/repos/{username}/{repo}/actions/runs/{run_id}',
-        headers=gh_headers(token), timeout=10)
-    return r.json() if r.status_code == 200 else None
-
-
 def get_jobs(token: str, username: str, repo: str, run_id: int) -> list:
     r = requests.get(
         f'https://api.github.com/repos/{username}/{repo}/actions/runs/{run_id}/jobs',
@@ -351,8 +653,9 @@ async def do_delete_repo(loop, github_token: str, username: str,
                 headers=gh_headers(github_token)))
         if r.status_code == 204:
             logger.info(f"Repo {repo_name} deleted")
-            await bot.send_message(chat_id=user_id,
-                                   text="🗑️ Repo GitHub đã được xóa tự động.")
+            await bot.send_message(
+                chat_id=user_id,
+                text="🗑️ Repo GitHub đã được xóa tự động để bảo mật.")
         else:
             logger.warning(f"Delete repo failed: {r.status_code}")
     except Exception as e:
@@ -409,9 +712,9 @@ async def setup_github(github_token: str, repo_name: str,
     return username
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Background task: tạo RDP + theo dõi hết hạn
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# Background task: tạo RDP + lưu Firebase
+# ═════════════════════════════════════════════════════════════════════════════
 
 async def create_rdp_background(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                  user_id: int):
@@ -422,11 +725,13 @@ async def create_rdp_background(update: Update, context: ContextTypes.DEFAULT_TY
     run_id       = None
 
     try:
-        github_token     = user_data[user_id]['github_token']
-        tailscale_key    = user_data[user_id]['tailscale_key']
+        github_token      = user_data[user_id]['github_token']
+        tailscale_key     = user_data[user_id]['tailscale_key']
         tailscale_api_key = user_data[user_id].get('tailscale_api_key')
-        duration_minutes = user_data[user_id].get('duration_minutes', 60)
-        duration_display = user_data[user_id].get('duration_display', '1h')
+        duration_minutes  = user_data[user_id].get('duration_minutes', 60)
+        duration_display  = user_data[user_id].get('duration_display', '1h')
+        tg_user           = update.effective_user
+        username_tg       = tg_user.username or tg_user.full_name or str(user_id)
         del user_data[user_id]
 
         random_password  = generate_password()
@@ -438,37 +743,54 @@ async def create_rdp_background(update: Update, context: ContextTypes.DEFAULT_TY
         if not username:
             await context.bot.send_message(
                 chat_id=user_id,
-                text="❌ Không thể tạo repo! Kiểm tra GitHub Token có đủ quyền `repo` và `workflow` không.")
+                text=(
+                    "╔══════════════════════════╗\n"
+                    "║  ❌  TẠO REPO THẤT BẠI   ║\n"
+                    "╚══════════════════════════╝\n\n"
+                    "GitHub Token cần có đủ quyền:\n"
+                    "• <code>repo</code>\n"
+                    "• <code>workflow</code>\n\n"
+                    "Vui lòng kiểm tra và thử lại."
+                ),
+                parse_mode='HTML')
             active_sessions.pop(user_id, None)
             return
 
-        repo_url   = f"https://github.com/{username}/{repo_name}"
         start_time = time.time()
 
-        # Lưu session NGAY sau khi workflow kích hoạt
         active_sessions[user_id] = {
-            'expire_at':       start_time + duration_minutes * 60,
-            'start_at':        start_time,
+            'expire_at':        start_time + duration_minutes * 60,
+            'start_at':         start_time,
             'duration_minutes': duration_minutes,
             'duration_display': duration_display,
-            'github_token':    github_token,
-            'username':        username,
-            'repo_name':       repo_name,
-            'run_id':          None,
+            'github_token':     github_token,
+            'username':         username,
+            'repo_name':        repo_name,
+            'run_id':           None,
+            'rdp_user':         rdp_username,
+            'rdp_pass':         random_password,
+            'rdp_ip':           None,
         }
 
         await context.bot.send_message(
             chat_id=user_id,
-            text=(f"✅ *Workflow đã kích hoạt!*\n\n"
-                  f"⏳ Đang chờ kết nối...\n"
-                  f"⏱️ Thời gian thuê: *{duration_display}*"),
-            parse_mode='Markdown', disable_web_page_preview=True)
+            text=(
+                "╔════════════════════════════════╗\n"
+                "║  ⚙️   ĐANG KHỞI ĐỘNG HỆ THỐNG  ║\n"
+                "╚════════════════════════════════╝\n\n"
+                "✅ Workflow đã được kích hoạt thành công!\n\n"
+                f"⏱️  Thời gian thuê  : <b>{duration_display}</b>\n"
+                f"⏳  Trạng thái      : Đang cài đặt Windows...\n\n"
+                "💬 Bạn sẽ nhận thông báo khi máy sẵn sàng."
+            ),
+            parse_mode='HTML',
+            disable_web_page_preview=True)
 
-        rdp_ip        = None
-        last_status   = None
+        rdp_ip         = None
+        last_status    = None
         tailscale_done = False
 
-        # ── Phase 1: Chờ step Connect Tailscale xong ──────────
+        # ── Phase 1: Chờ workflow chạy ────────────────────────
         for attempt in range(90):
             await asyncio.sleep(10)
             try:
@@ -478,7 +800,6 @@ async def create_rdp_background(update: Update, context: ContextTypes.DEFAULT_TY
                     if run:
                         run_id = run['id']
                         active_sessions[user_id]['run_id'] = run_id
-                        logger.info(f"run_id={run_id}")
                     continue
 
                 jobs = await loop.run_in_executor(None, lambda:
@@ -490,14 +811,27 @@ async def create_rdp_background(update: Update, context: ContextTypes.DEFAULT_TY
                 if job_status != last_status:
                     last_status = job_status
                     if job_status == 'in_progress':
-                        await context.bot.send_message(chat_id=user_id,
-                                                        text="⚙️ Setup Windows 11...")
+                        await context.bot.send_message(
+                            chat_id=user_id,
+                            text=(
+                                "🔧 <b>Tiến trình cài đặt:</b>\n\n"
+                                "✅ Khởi động máy ảo\n"
+                                "🔄 Cài đặt Windows 11...\n"
+                                "⏳ Vui lòng chờ (5-10 phút)"
+                            ),
+                            parse_mode='HTML')
 
                 if (job_status == 'completed'
                         and jobs[0].get('conclusion') not in ['success', None]):
                     await context.bot.send_message(
                         chat_id=user_id,
-                        text=f"❌ Workflow thất bại!\n{repo_url}/actions/runs/{run_id}")
+                        text=(
+                            "╔═══════════════════════════╗\n"
+                            "║  ❌  WORKFLOW THẤT BẠI    ║\n"
+                            "╚═══════════════════════════╝\n\n"
+                            "Máy ảo không thể khởi động.\n"
+                            "Vui lòng dùng /create để thử lại."
+                        ))
                     active_sessions.pop(user_id, None)
                     return
 
@@ -510,7 +844,14 @@ async def create_rdp_background(update: Update, context: ContextTypes.DEFAULT_TY
 
         # ── Phase 2: Lấy IP ──────────────────────────────────
         if tailscale_done:
-            await context.bot.send_message(chat_id=user_id, text="🖥️ Setup app Windows...")
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    "🌐 <b>Tailscale đã kết nối!</b>\n"
+                    "⏳ Đang lấy địa chỉ IP, vui lòng chờ..."
+                ),
+                parse_mode='HTML')
+
             for retry in range(12):
                 rdp_ip = await loop.run_in_executor(None, lambda:
                     get_ip_from_artifact(github_token, username, repo_name, run_id))
@@ -524,59 +865,97 @@ async def create_rdp_background(update: Update, context: ContextTypes.DEFAULT_TY
                 logger.info(f"IP retry {retry+1}/12")
                 await asyncio.sleep(10)
 
+        # ── Lưu lên Firebase ─────────────────────────────────
+        if rdp_ip:
+            active_sessions[user_id]['rdp_ip'] = rdp_ip
+            loop.run_in_executor(None, lambda:
+                save_rdp_to_firebase(
+                    user_id, username_tg, rdp_ip,
+                    rdp_username, random_password,
+                    duration_minutes, start_time))
+
         # ── Gửi thông tin login ──────────────────────────────
+        expire_time_str = format_datetime_vn(start_time + duration_minutes * 60)
+        create_time_str = format_datetime_vn(start_time)
+
         if rdp_ip:
             await context.bot.send_message(
                 chat_id=user_id,
                 text=(
-                    f"🎉 <b>WINDOWS AI STV SẴN SÀNG!</b>\n\n"
-                    f"🖥️ Máy chủ : <b>AI STV</b>\n"
-                    f"👤 Username : <code>{rdp_username}</code>\n"
-                    f"🔑 Password : <code>{random_password}</code>\n"
-                    f"🌐 IP       : <code>{rdp_ip}</code>\n\n"
-                    "📋 <b>Kết nối:</b>\n"
-                    "1. Cài Tailscale: https://tailscale.com/download\n"
-                    "2. Đăng nhập cùng tài khoản Tailscale\n"
-                    "3. Bật kết nối và vào Windows app\n\n"
-                    f"⏱️ Thời gian: {duration_display} ({duration_minutes} phút)\n"
-                    f"⚠️ Máy ảo tự tắt sau {duration_display}\n"
-                    f"💡 Dùng /check để xem thời gian còn lại."
+                    "╔══════════════════════════════════╗\n"
+                    "║  🎉  WINDOWS AI STV SẴN SÀNG!   ║\n"
+                    "╚══════════════════════════════════╝\n\n"
+                    "━━━━━━ 🖥️  THÔNG TIN KẾT NỐI ━━━━━━\n\n"
+                    f"🌐  IP Address  : <code>{rdp_ip}</code>\n"
+                    f"👤  Username    : <code>{rdp_username}</code>\n"
+                    f"🔑  Password    : <code>{random_password}</code>\n\n"
+                    "━━━━━━ ⏰  THỜI GIAN SỬ DỤNG ━━━━━━\n\n"
+                    f"📅  Bắt đầu    : {create_time_str}\n"
+                    f"⌛  Hết hạn    : {expire_time_str}\n"
+                    f"⏱️  Thời lượng  : {duration_display}\n\n"
+                    "━━━━━━ 📋  HƯỚNG DẪN KẾT NỐI ━━━━━━\n\n"
+                    "1️⃣  Tải Tailscale: tailscale.com/download\n"
+                    "2️⃣  Đăng nhập cùng tài khoản Tailscale\n"
+                    "3️⃣  Bật kết nối → Mở Remote Desktop\n"
+                    "4️⃣  Nhập IP, username và password\n\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    "💡 Dùng /check để xem thời gian còn lại\n"
+                    "⚠️  Máy ảo tự tắt khi hết thời gian"
                 ),
                 parse_mode='HTML',
                 disable_web_page_preview=True)
         else:
             await context.bot.send_message(
                 chat_id=user_id,
-                text=("⚠️ *Không tự lấy được IP.*\n\n"
-                      "Xem IP tại: https://login.tailscale.com/admin/machines\n"
-                      "💡 Dùng /check để xem thời gian còn lại."),
-                parse_mode='Markdown', disable_web_page_preview=True)
+                text=(
+                    "╔════════════════════════════════╗\n"
+                    "║  ⚠️   KHÔNG LẤY ĐƯỢC ĐỊA CHỈ IP  ║\n"
+                    "╚════════════════════════════════╝\n\n"
+                    f"👤  Username  : <code>{rdp_username}</code>\n"
+                    f"🔑  Password  : <code>{random_password}</code>\n\n"
+                    "🔍 Xem IP tại:\n"
+                    "login.tailscale.com/admin/machines\n\n"
+                    "💡 Dùng /check để xem thời gian còn lại."
+                ),
+                parse_mode='HTML',
+                disable_web_page_preview=True)
 
         # ── Xóa workflow file ─────────────────────────────────
-        deleted = await loop.run_in_executor(None, lambda:
+        await loop.run_in_executor(None, lambda:
             delete_workflow_file(github_token, username, repo_name))
-        if deleted:
-            await context.bot.send_message(chat_id=user_id, text="Hoàn thành\n Chúc bạn sử dụng dịch vụ vui vẻ.")
 
-        # ── Phase 3: Chờ hết hạn rồi thông báo & xóa repo ────
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=(
+                "🔒 File workflow đã được xóa để bảo mật.\n\n"
+                "✨ <b>Chúc bạn sử dụng dịch vụ vui vẻ!</b>"
+            ),
+            parse_mode='HTML')
+
+        # ── Phase 3: Chờ hết hạn ─────────────────────────────
         expire_at = active_sessions[user_id]['expire_at']
         wait_secs = max(expire_at - time.time(), 0)
         logger.info(f"Chờ {wait_secs:.0f}s trước khi thông báo hết hạn...")
         await asyncio.sleep(wait_secs)
 
-        # Thông báo hết hạn
         await context.bot.send_message(
             chat_id=user_id,
-            text=(f"⏰ *Windows của bạn đã hết hạn!*\n\n"
-                  f"Thời gian thuê *{duration_display}* đã kết thúc.\n"
-                  f"Máy ảo sẽ tự tắt. Gõ /create để tạo máy mới."),
-            parse_mode='Markdown')
+            text=(
+                "╔══════════════════════════════╗\n"
+                "║  ⏰  PHIÊN LÀM VIỆC HẾT HẠN  ║\n"
+                "╚══════════════════════════════╝\n\n"
+                f"Thời gian thuê <b>{duration_display}</b> đã kết thúc.\n"
+                "Máy ảo sẽ tự động tắt.\n\n"
+                "🔄 Dùng /create để tạo máy mới."
+            ),
+            parse_mode='HTML')
 
-        # Xóa session
+        # Cập nhật Firebase: hết hạn
+        await loop.run_in_executor(None, lambda: mark_rdp_expired_firebase(user_id))
         active_sessions.pop(user_id, None)
 
-        # Chờ workflow finish rồi xóa repo
-        max_polls = 15 * 6  # thêm tối đa 15 phút buffer
+        # Chờ workflow kết thúc rồi xóa repo
+        max_polls = 15 * 6
         for attempt in range(max_polls):
             await asyncio.sleep(10)
             try:
@@ -594,7 +973,14 @@ async def create_rdp_background(update: Update, context: ContextTypes.DEFAULT_TY
         logger.error(f"Background error: {e}", exc_info=True)
         await context.bot.send_message(
             chat_id=user_id,
-            text=f"❌ Lỗi: {str(e)}\nGõ /create để thử lại.")
+            text=(
+                "╔═══════════════════════╗\n"
+                "║  ❌  ĐÃ XẢY RA LỖI   ║\n"
+                "╚═══════════════════════╝\n\n"
+                f"Chi tiết: <code>{str(e)}</code>\n\n"
+                "🔄 Dùng /create để thử lại."
+            ),
+            parse_mode='HTML')
         active_sessions.pop(user_id, None)
         if username and repo_name and github_token:
             loop2 = asyncio.get_running_loop()
@@ -602,20 +988,58 @@ async def create_rdp_background(update: Update, context: ContextTypes.DEFAULT_TY
                                   context.bot, user_id)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# /check — Kiểm tra thời gian còn lại
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# /check — Xem thông tin RDP hiện tại
+# ═════════════════════════════════════════════════════════════════════════════
 
 async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+
+    # Kiểm tra session local trước
     session = active_sessions.get(user_id)
 
+    # Nếu không có local thì kiểm tra Firebase
     if not session:
+        fb_data = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: check_user_has_active_rdp_firebase(user_id))
+
+        if not fb_data:
+            await update.message.reply_text(
+                "╔═══════════════════════════════╗\n"
+                "║  ℹ️   KHÔNG CÓ MÁY ĐANG CHẠY  ║\n"
+                "╚═══════════════════════════════╝\n\n"
+                "Bạn chưa có phiên Windows nào đang hoạt động.\n\n"
+                "🚀 Dùng /create để tạo máy mới.",
+                parse_mode='HTML')
+            return
+
+        # Hiển thị từ Firebase
+        now       = time.time()
+        exp_ts    = fb_data.get("expires_ts", 0)
+        crt_ts    = fb_data.get("created_ts", now)
+        remaining = exp_ts - now
+        elapsed   = now - crt_ts
+        total_secs = fb_data.get("duration_minutes", 60) * 60
+        percent_used = min(int(elapsed / total_secs * 100), 100)
+        bar = create_progress_bar(percent_used)
+
         await update.message.reply_text(
-            "ℹ️ Bạn chưa có máy Windows nào đang chạy.\n"
-            "Gõ /create để tạo máy mới.")
+            "╔═════════════════════════════════╗\n"
+            "║  🖥️   THÔNG TIN MÁY WINDOWS      ║\n"
+            "╚═════════════════════════════════╝\n\n"
+            "━━━━━━ 🔌  KẾT NỐI ━━━━━━\n\n"
+            f"🌐  IP Address  : <code>{fb_data.get('ip', 'N/A')}</code>\n"
+            f"👤  Username    : <code>{fb_data.get('rdp_user', 'N/A')}</code>\n"
+            f"🔑  Password    : <code>{fb_data.get('rdp_pass', 'N/A')}</code>\n\n"
+            "━━━━━━ ⏰  THỜI GIAN ━━━━━━\n\n"
+            f"📅  Bắt đầu    : {fb_data.get('created_at', 'N/A')}\n"
+            f"⌛  Hết hạn    : {fb_data.get('expires_at', 'N/A')}\n"
+            f"⏱️  Còn lại    : <b>{format_remaining(remaining)}</b>\n\n"
+            f"<code>[{bar}] {percent_used}%</code>",
+            parse_mode='HTML')
         return
 
+    # Hiển thị từ local session
     now        = time.time()
     expire_at  = session['expire_at']
     start_at   = session['start_at']
@@ -626,53 +1050,98 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if remaining <= 0:
         active_sessions.pop(user_id, None)
         await update.message.reply_text(
-            "⏰ *Windows của bạn đã hết hạn!*\n"
-            "Gõ /create để tạo máy mới.",
-            parse_mode='Markdown')
+            "╔════════════════════════════╗\n"
+            "║  ⏰  PHIÊN ĐÃ HẾT HẠN      ║\n"
+            "╚════════════════════════════╝\n\n"
+            "Máy ảo của bạn đã tắt.\n\n"
+            "🔄 Dùng /create để tạo máy mới.",
+            parse_mode='HTML')
         return
 
-    # Tính % đã dùng
     percent_used = min(int(elapsed / total_secs * 100), 100)
-    bar_filled   = percent_used // 10
-    bar          = "█" * bar_filled + "░" * (10 - bar_filled)
+    bar = create_progress_bar(percent_used)
+    rdp_ip   = session.get('rdp_ip', 'Đang lấy...')
+    rdp_user = session.get('rdp_user', 'N/A')
+    rdp_pass = session.get('rdp_pass', 'N/A')
+
+    expire_str = format_datetime_vn(expire_at)
+    start_str  = format_datetime_vn(start_at)
 
     await update.message.reply_text(
-        f"🖥️ *Trạng thái Windows của bạn:*\n\n"
-        f"⏱️ Thời gian thuê: *{session['duration_display']}*\n"
-        f"✅ Đã dùng: `{format_remaining(elapsed)}`\n"
-        f"⏳ Còn lại: *{format_remaining(remaining)}*\n\n"
-        f"`[{bar}] {percent_used}%`\n\n"
-        f"⚠️ Máy sẽ tự tắt khi hết thời gian.",
-        parse_mode='Markdown')
+        "╔═════════════════════════════════╗\n"
+        "║  🖥️   THÔNG TIN MÁY WINDOWS      ║\n"
+        "╚═════════════════════════════════╝\n\n"
+        "━━━━━━ 🔌  KẾT NỐI ━━━━━━\n\n"
+        f"🌐  IP Address  : <code>{rdp_ip}</code>\n"
+        f"👤  Username    : <code>{rdp_user}</code>\n"
+        f"🔑  Password    : <code>{rdp_pass}</code>\n\n"
+        "━━━━━━ ⏰  THỜI GIAN ━━━━━━\n\n"
+        f"📅  Bắt đầu    : {start_str}\n"
+        f"⌛  Hết hạn    : {expire_str}\n"
+        f"✅  Đã dùng    : {format_remaining(elapsed)}\n"
+        f"⏳  Còn lại    : <b>{format_remaining(remaining)}</b>\n\n"
+        f"<code>[{bar}] {percent_used}%</code>\n\n"
+        "⚠️  Máy tự tắt khi hết thời gian.",
+        parse_mode='HTML')
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Conversation handlers
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# Conversation handlers (tạo RDP)
+# ═════════════════════════════════════════════════════════════════════════════
 
 async def create_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    loop    = asyncio.get_running_loop()
 
-    # Kiểm tra session đang chạy
+    # Kiểm tra session đang chạy (local)
     session = active_sessions.get(user_id)
     if session:
         remaining = session['expire_at'] - time.time()
         if remaining > 0:
             await update.message.reply_text(
-                f"⚠️ *Bạn đang có máy Windows đang chạy!*\n\n"
-                f"⏳ Thời gian còn lại: *{format_remaining(remaining)}*\n\n"
-                f"Chỉ được tạo 1 máy tại một thời điểm.\n"
-                f"Dùng /check để kiểm tra chi tiết.",
-                parse_mode='Markdown')
+                "╔═══════════════════════════════════╗\n"
+                "║  ⚠️   BẠN ĐÃ CÓ MÁY ĐANG CHẠY!    ║\n"
+                "╚═══════════════════════════════════╝\n\n"
+                f"⏳  Còn lại : <b>{format_remaining(remaining)}</b>\n\n"
+                "Mỗi tài khoản chỉ được tạo <b>1 máy</b> tại một thời điểm.\n"
+                "Chờ hết hạn mới tạo được máy mới.\n\n"
+                "💡 Dùng /check để xem chi tiết.",
+                parse_mode='HTML')
             return ConversationHandler.END
         else:
-            # Session hết hạn, dọn sạch
             active_sessions.pop(user_id, None)
+
+    # Kiểm tra Firebase
+    fb_data = await loop.run_in_executor(
+        None, lambda: check_user_has_active_rdp_firebase(user_id))
+
+    if fb_data:
+        exp_ts    = fb_data.get("expires_ts", 0)
+        remaining = exp_ts - time.time()
+        await update.message.reply_text(
+            "╔═══════════════════════════════════╗\n"
+            "║  ⚠️   BẠN ĐÃ CÓ MÁY ĐANG CHẠY!    ║\n"
+            "╚═══════════════════════════════════╝\n\n"
+            f"🌐  IP       : <code>{fb_data.get('ip', 'N/A')}</code>\n"
+            f"👤  Username : <code>{fb_data.get('rdp_user', 'N/A')}</code>\n"
+            f"⏳  Còn lại  : <b>{format_remaining(remaining)}</b>\n"
+            f"⌛  Hết hạn  : {fb_data.get('expires_at', 'N/A')}\n\n"
+            "Mỗi tài khoản chỉ được tạo <b>1 máy</b> tại một thời điểm.\n"
+            "Chờ hết hạn mới tạo được máy mới.\n\n"
+            "💡 Dùng /check để xem đầy đủ thông tin.",
+            parse_mode='HTML')
+        return ConversationHandler.END
 
     user_data[user_id] = {}
     await update.message.reply_text(
-        "🔑 *Bước 1/4* — Gửi GitHub Personal Access Token:\n\nCần quyền: `repo` và `workflow`",
-        parse_mode='Markdown')
+        "╔══════════════════════════════╗\n"
+        "║  🚀  TẠO WINDOWS AI STV MỚI  ║\n"
+        "╚══════════════════════════════╝\n\n"
+        "📍 <b>Bước 1/4</b> — GitHub Personal Access Token\n\n"
+        "Cần cấp quyền: <code>repo</code> và <code>workflow</code>\n"
+        "Tạo tại: github.com/settings/tokens\n\n"
+        "Vui lòng gửi token:",
+        parse_mode='HTML')
     return GITHUB_TOKEN_STATE
 
 
@@ -680,15 +1149,16 @@ async def get_github_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     token   = update.message.text.strip()
     if len(token) < 10:
-        await update.message.reply_text("❌ Token không hợp lệ!")
+        await update.message.reply_text("❌ Token không hợp lệ! Vui lòng gửi lại.")
         return ConversationHandler.END
     user_data[user_id]['github_token'] = token
     await update.message.reply_text(
-        "✅ Đã nhận!\n\n"
-        "🔑 *Bước 2/4* — Gửi Tailscale Auth Key:\n"
-        "_(bắt đầu bằng `tskey-auth-...`)_\n\n"
-        "Tạo tại: https://login.tailscale.com/admin/settings/keys",
-        parse_mode='Markdown')
+        "✅ GitHub Token đã nhận!\n\n"
+        "📍 <b>Bước 2/4</b> — Tailscale Auth Key\n\n"
+        "Định dạng: <code>tskey-auth-...</code>\n"
+        "Tạo tại: login.tailscale.com/admin/settings/keys\n\n"
+        "Vui lòng gửi Auth Key:",
+        parse_mode='HTML')
     return TAILSCALE_KEY_STATE
 
 
@@ -696,16 +1166,21 @@ async def get_tailscale_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     key     = update.message.text.strip()
     if not key.startswith('tskey-') or len(key) < 40:
-        await update.message.reply_text("❌ Auth key không hợp lệ! Gửi /create để thử lại.")
+        await update.message.reply_text(
+            "❌ Auth Key không hợp lệ!\n"
+            "Phải bắt đầu bằng <code>tskey-auth-...</code>\n\n"
+            "Dùng /create để thử lại.",
+            parse_mode='HTML')
         return ConversationHandler.END
     user_data[user_id]['tailscale_key'] = key
     await update.message.reply_text(
-        "✅ Đã nhận!\n\n"
-        "🔑 *Bước 3/4* — Gửi Tailscale API Key:\n"
-        "_(bắt đầu bằng `tskey-api-...`)_\n\n"
-        "Tạo tại: https://login.tailscale.com/admin/settings/keys\n"
-        "_(Chọn loại *API access token*)_",
-        parse_mode='Markdown')
+        "✅ Tailscale Auth Key đã nhận!\n\n"
+        "📍 <b>Bước 3/4</b> — Tailscale API Key\n\n"
+        "Định dạng: <code>tskey-api-...</code>\n"
+        "Chọn loại <b>API access token</b>\n"
+        "Tạo tại: login.tailscale.com/admin/settings/keys\n\n"
+        "Vui lòng gửi API Key:",
+        parse_mode='HTML')
     return TAILSCALE_API_STATE
 
 
@@ -713,14 +1188,16 @@ async def get_tailscale_api_key(update: Update, context: ContextTypes.DEFAULT_TY
     user_id = update.effective_user.id
     api_key = update.message.text.strip()
     if not api_key.startswith('tskey-') or len(api_key) < 40:
-        await update.message.reply_text("❌ API key không hợp lệ! Gửi /create để thử lại.")
+        await update.message.reply_text(
+            "❌ API Key không hợp lệ!\n"
+            "Phải bắt đầu bằng <code>tskey-api-...</code>\n\n"
+            "Dùng /create để thử lại.",
+            parse_mode='HTML')
         return ConversationHandler.END
     user_data[user_id]['tailscale_api_key'] = api_key
 
     is_admin = (user_id == ADMIN_ID)
-
     if is_admin:
-        # Admin có thêm nút 15p, 30p, 4h, 5h, 6h
         keyboard = [
             [
                 InlineKeyboardButton("15p", callback_data='dur_15'),
@@ -737,11 +1214,9 @@ async def get_tailscale_api_key(update: Update, context: ContextTypes.DEFAULT_TY
                 InlineKeyboardButton("5h",    callback_data='dur_300'),
                 InlineKeyboardButton("6h",    callback_data='dur_360'),
             ],
-            [
-                InlineKeyboardButton("⌨️ Tự nhập", callback_data='dur_custom'),
-            ]
+            [InlineKeyboardButton("⌨️ Tự nhập thời gian", callback_data='dur_custom')]
         ]
-        note = "🔑 *[ADMIN]* Tối thiểu: *15p* | Tối đa: *6h*"
+        note = "👑 <b>[ADMIN]</b> — Giới hạn: 15 phút → 6 giờ"
     else:
         keyboard = [
             [
@@ -755,38 +1230,39 @@ async def get_tailscale_api_key(update: Update, context: ContextTypes.DEFAULT_TY
                 InlineKeyboardButton("⌨️ Tự nhập", callback_data='dur_custom'),
             ]
         ]
-        note = "🕐 Tối thiểu: *1 giờ* | Tối đa: *3 giờ*"
+        note = "⏱️ Giới hạn: 1 giờ → 3 giờ"
 
     await update.message.reply_text(
-        f"✅ Đã nhận!\n\n"
-        f"⏱️ *Bước 4/4* — Chọn thời gian sử dụng máy ảo:\n\n"
+        "✅ Tailscale API Key đã nhận!\n\n"
+        "╔══════════════════════════════╗\n"
+        "║  ⏱️   BƯỚC 4/4 — THỜI GIAN   ║\n"
+        "╚══════════════════════════════╝\n\n"
         f"{note}\n\n"
-        f"Chọn nhanh hoặc nhấn *Tự nhập* để nhập thủ công",
-        parse_mode='Markdown',
+        "Chọn thời gian sử dụng máy ảo:",
+        parse_mode='HTML',
         reply_markup=InlineKeyboardMarkup(keyboard))
     return DURATION_STATE
 
 
 async def duration_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query   = update.callback_query
+    query    = update.callback_query
     await query.answer()
-    user_id = update.effective_user.id
+    user_id  = update.effective_user.id
     is_admin = (user_id == ADMIN_ID)
 
     if query.data == 'dur_custom':
-        if is_admin:
-            limit_text = "⚠️ Giới hạn: từ *15p* đến *6h*"
-        else:
-            limit_text = "⚠️ Giới hạn: từ *1h* đến *3h*"
+        limit_text = ("⚠️ Giới hạn: <b>15p → 6h</b>" if is_admin
+                      else "⚠️ Giới hạn: <b>1h → 3h</b>")
         await query.edit_message_text(
-            f"⌨️ Nhập thời gian bạn muốn:\n\n"
-            f"📝 *Định dạng:*\n"
-            f"• `1h` = 1 giờ\n"
-            f"• `2h30p` = 2 giờ 30 phút\n"
-            f"• `1h26p` = 1 giờ 26 phút\n"
-            f"• `90p` = 90 phút\n\n"
-            f"{limit_text}",
-            parse_mode='Markdown')
+            "⌨️ <b>Nhập thời gian tùy chỉnh:</b>\n\n"
+            "📝 Định dạng hỗ trợ:\n"
+            "• <code>1h</code>     → 1 giờ\n"
+            "• <code>2h30p</code>  → 2 giờ 30 phút\n"
+            "• <code>1h26p</code>  → 1 giờ 26 phút\n"
+            "• <code>90p</code>    → 90 phút\n\n"
+            f"{limit_text}\n\n"
+            "Vui lòng nhập thời gian:",
+            parse_mode='HTML')
         return DURATION_STATE
 
     minutes = int(query.data.replace('dur_', ''))
@@ -794,7 +1270,7 @@ async def duration_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw_str = f"{h}h{m}p" if m else f"{h}h" if h else f"{minutes}p"
     result  = parse_duration(raw_str, user_id)
     if not result:
-        await query.edit_message_text("❌ Lỗi thời gian, thử lại /create")
+        await query.edit_message_text("❌ Lỗi thời gian. Dùng /create để thử lại.")
         return ConversationHandler.END
 
     total_minutes, display = result
@@ -804,24 +1280,21 @@ async def duration_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def get_duration_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    text    = update.message.text.strip()
-    result  = parse_duration(text, user_id)
-
+    user_id  = update.effective_user.id
+    text     = update.message.text.strip()
+    result   = parse_duration(text, user_id)
     is_admin = (user_id == ADMIN_ID)
-    if is_admin:
-        limit_text = "⚠️ Giới hạn: từ *15p* đến *6h* (15 - 360 phút)"
-    else:
-        limit_text = "⚠️ Giới hạn: từ *1h* đến *3h* (60 - 180 phút)"
 
     if not result:
+        limit_text = ("⚠️ Giới hạn: 15p → 6h (15-360 phút)"
+                      if is_admin else "⚠️ Giới hạn: 1h → 3h (60-180 phút)")
         await update.message.reply_text(
-            f"❌ Thời gian không hợp lệ!\n\n"
+            "❌ <b>Thời gian không hợp lệ!</b>\n\n"
             f"{limit_text}\n\n"
-            f"📝 *Ví dụ đúng:*\n"
-            f"• `1h` • `2h30p` • `1h26p` • `90p`\n\n"
-            f"Nhập lại:",
-            parse_mode='Markdown')
+            "📝 Ví dụ đúng:\n"
+            "<code>1h</code> · <code>2h30p</code> · <code>1h26p</code> · <code>90p</code>\n\n"
+            "Vui lòng nhập lại:",
+            parse_mode='HTML')
         return DURATION_STATE
 
     total_minutes, display = result
@@ -833,22 +1306,24 @@ async def get_duration_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_confirm(update_or_query, user_id: int, is_query: bool):
     data     = user_data[user_id]
     keyboard = [[
-        InlineKeyboardButton("✅ Bắt đầu tạo", callback_data='start_create'),
-        InlineKeyboardButton("❌ Hủy",          callback_data='cancel')
+        InlineKeyboardButton("🚀 Bắt đầu tạo máy", callback_data='start_create'),
+        InlineKeyboardButton("❌ Hủy",              callback_data='cancel')
     ]]
     text = (
-        f"✅ *Sẵn sàng tạo WINDOWS!*\n\n"
-        f"• GitHub Token: `{data['github_token'][:10]}...`\n"
-        f"• Tailscale Auth Key: `{data['tailscale_key'][:15]}...`\n"
-        f"• Tailscale API Key: `{data['tailscale_api_key'][:15]}...`\n"
-        f"• ⏱️ Thời gian: *{data['duration_display']}* ({data['duration_minutes']} phút)\n\n"
-        f"Nhấn *Bắt đầu tạo* để tiến hành!"
+        "╔══════════════════════════════╗\n"
+        "║  ✅  XÁC NHẬN TẠO WINDOWS    ║\n"
+        "╚══════════════════════════════╝\n\n"
+        f"🔑  GitHub Token    : <code>{data['github_token'][:10]}...</code>\n"
+        f"🔐  Tailscale Auth  : <code>{data['tailscale_key'][:15]}...</code>\n"
+        f"🗝️   Tailscale API   : <code>{data['tailscale_api_key'][:15]}...</code>\n"
+        f"⏱️   Thời gian       : <b>{data['duration_display']}</b> ({data['duration_minutes']} phút)\n\n"
+        "Nhấn <b>Bắt đầu tạo máy</b> để tiến hành!"
     )
     markup = InlineKeyboardMarkup(keyboard)
     if is_query:
-        await update_or_query.edit_message_text(text, parse_mode='Markdown', reply_markup=markup)
+        await update_or_query.edit_message_text(text, parse_mode='HTML', reply_markup=markup)
     else:
-        await update_or_query.message.reply_text(text, parse_mode='Markdown', reply_markup=markup)
+        await update_or_query.message.reply_text(text, parse_mode='HTML', reply_markup=markup)
     return CONFIRM_STATE
 
 
@@ -859,71 +1334,109 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.data == 'cancel':
         user_data.pop(user_id, None)
-        await query.edit_message_text("❌ Đã hủy.")
+        await query.edit_message_text(
+            "❌ Đã hủy tạo máy.\n\n"
+            "Dùng /create để bắt đầu lại.")
         return ConversationHandler.END
 
     if query.data.startswith('dur_'):
         return await duration_callback(update, context)
 
-    # start_create
-    await query.edit_message_text("🔄 *Đang tạo Windows AI STV...* ⏳", parse_mode='Markdown')
+    await query.edit_message_text(
+        "╔══════════════════════════════╗\n"
+        "║  🔄  ĐANG KHỞI TẠO WINDOWS   ║\n"
+        "╚══════════════════════════════╝\n\n"
+        "Hệ thống đang chuẩn bị máy ảo...\n"
+        "Quá trình mất khoảng 5-10 phút.\n\n"
+        "⏳ Bạn sẽ nhận thông báo khi hoàn tất.",
+        parse_mode='HTML')
     asyncio.create_task(create_rdp_background(update, context, user_id))
     return ConversationHandler.END
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Các lệnh chung
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# Lệnh chung
+# ═════════════════════════════════════════════════════════════════════════════
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    name = user.first_name or "bạn"
     await update.message.reply_text(
-        "🤖 *WINDOWS AI STV*\n\n"
-        "Tạo miễn phí Windows 11\n\n"
-        "Gõ /create để bắt đầu!\n\n"
-        "📋 *Cần chuẩn bị:*\n"
-        "1. GitHub Token (Cấp tất cả quyền)\n"
-        "2. Tailscale Auth Key (`tskey-auth-...`)\n"
-        "3. Tailscale API Key (`tskey-api-...`)\n\n"
-        "⏱️ *Thời gian:* từ 1h đến 3h\n"
-        "💡 /check — Xem thời gian còn lại",
-        parse_mode='Markdown')
+        f"👋 Xin chào, <b>{name}</b>!\n\n"
+        "╔══════════════════════════════╗\n"
+        "║  🖥️   WINDOWS AI STV BOT      ║\n"
+        "╚══════════════════════════════╝\n\n"
+        "Tạo máy ảo Windows 11 miễn phí\n"
+        "thông qua GitHub Actions + Tailscale.\n\n"
+        "━━━━━━ 📋  LỆNH CÓ SẴN ━━━━━━\n\n"
+        "🚀 /create     — Tạo máy Windows mới\n"
+        "📊 /check      — Xem thông tin & thời gian\n"
+        "🔌 /connect    — Kết nối máy ảo từ xa\n"
+        "❓ /help       — Hướng dẫn chi tiết\n"
+        "❌ /cancel     — Hủy thao tác\n\n"
+        "━━━━━━ 🔑  CẦN CHUẨN BỊ ━━━━━━\n\n"
+        "1️⃣  GitHub Token (quyền repo + workflow)\n"
+        "2️⃣  Tailscale Auth Key (tskey-auth-...)\n"
+        "3️⃣  Tailscale API Key (tskey-api-...)\n\n"
+        "━━━━━━ ⏱️  THỜI GIAN ━━━━━━\n\n"
+        "Từ <b>1 giờ</b> đến <b>3 giờ</b>\n"
+        "⚠️ Mỗi người chỉ tạo được <b>1 máy</b>\n\n"
+        "🚀 Gõ /create để bắt đầu!",
+        parse_mode='HTML')
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_data.pop(update.effective_user.id, None)
-    await update.message.reply_text("❌ Đã hủy. Gõ /create để bắt đầu lại.")
+    await update.message.reply_text(
+        "❌ Đã hủy thao tác hiện tại.\n\n"
+        "Dùng /create để bắt đầu lại.")
     return ConversationHandler.END
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📚 *HƯỚNG DẪN*\n\n"
-        "/create — Tạo Windows mới\n"
-        "/check  — Xem thời gian còn lại\n"
-        "/cancel — Hủy\n\n"
-        "*3 key cần có:*\n"
-        "• GitHub Token: github.com/settings/tokens\n"
-        "• Tailscale Auth Key: login.tailscale.com/admin/settings/keys\n"
-        "• Tailscale API Key: login.tailscale.com/admin/settings/keys\n\n"
-        "⏱️ *Thời gian:* 1h – 3h (tùy chọn khi tạo)\n"
-        "⚠️ Mỗi người chỉ được tạo *1 máy* tại một thời điểm.",
-        parse_mode='Markdown')
+        "╔══════════════════════════════╗\n"
+        "║  📚  HƯỚNG DẪN SỬ DỤNG       ║\n"
+        "╚══════════════════════════════╝\n\n"
+        "━━━━━━ 🛠️  CÁC LỆNH ━━━━━━\n\n"
+        "🚀 /create   — Tạo máy Windows mới\n"
+        "📊 /check    — Xem thông tin máy hiện tại\n"
+        "🔌 /connect  — Kết nối & chạy bot trên máy khác\n"
+        "❌ /cancel   — Hủy thao tác đang thực hiện\n\n"
+        "━━━━━━ 🔑  CÁCH LẤY KEY ━━━━━━\n\n"
+        "GitHub Token:\n"
+        "→ github.com/settings/tokens\n"
+        "→ Cấp quyền: repo + workflow\n\n"
+        "Tailscale Auth Key:\n"
+        "→ login.tailscale.com/admin/settings/keys\n"
+        "→ Chọn: Auth Keys\n\n"
+        "Tailscale API Key:\n"
+        "→ login.tailscale.com/admin/settings/keys\n"
+        "→ Chọn: API access tokens\n\n"
+        "━━━━━━ ℹ️  LƯU Ý ━━━━━━\n\n"
+        "⏱️  Thời gian: 1 giờ — 3 giờ\n"
+        "👤  Mỗi người chỉ tạo được <b>1 máy</b>\n"
+        "🔒  Thông tin được lưu an toàn\n"
+        "🗑️  Repo tự động xóa sau khi hết hạn",
+        parse_mode='HTML')
 
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Error: {context.error}", exc_info=True)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
 # Main
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
 
 def main():
     application = Application.builder().token(BOT_TOKEN).build()
-    conv = ConversationHandler(
+
+    # Conversation: tạo RDP
+    rdp_conv = ConversationHandler(
         entry_points=[CommandHandler('create', create_command)],
         states={
-            GITHUB_TOKEN_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_github_token)],
+            GITHUB_TOKEN_STATE:  [MessageHandler(filters.TEXT & ~filters.COMMAND, get_github_token)],
             TAILSCALE_KEY_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_tailscale_key)],
             TAILSCALE_API_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_tailscale_api_key)],
             DURATION_STATE: [
@@ -935,12 +1448,27 @@ def main():
         fallbacks=[CommandHandler('cancel', cancel_command)],
         per_message=False
     )
+
+    # Conversation: kết nối máy từ xa
+    connect_conv = ConversationHandler(
+        entry_points=[CommandHandler('connect', connect_command)],
+        states={
+            REMOTE_IP_STATE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, get_remote_ip)],
+            REMOTE_USER_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_remote_user)],
+            REMOTE_PASS_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_remote_pass)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel_command)],
+        per_message=False
+    )
+
     application.add_handler(CommandHandler('start',  start))
     application.add_handler(CommandHandler('help',   help_command))
     application.add_handler(CommandHandler('check',  check_command))
     application.add_handler(CommandHandler('cancel', cancel_command))
-    application.add_handler(conv)
+    application.add_handler(rdp_conv)
+    application.add_handler(connect_conv)
     application.add_error_handler(error_handler)
+
     print("🤖 Bot đang chạy...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
@@ -949,5 +1477,5 @@ if __name__ == '__main__':
     try:
         import telegram
     except ImportError:
-        os.system("pip install python-telegram-bot pynacl requests")
+        os.system("pip install python-telegram-bot pynacl requests pywinrm")
     main()

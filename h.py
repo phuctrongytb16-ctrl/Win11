@@ -1,3 +1,5 @@
+#test
+
 import os
 import zipfile
 import io
@@ -9,7 +11,7 @@ import re
 import threading
 import tempfile
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (Application, CommandHandler, MessageHandler,
@@ -122,8 +124,8 @@ def save_rdp_to_firebase(user_id: int, username_tg: str, ip: str,
         "rdp_user":         rdp_user,
         "rdp_pass":         rdp_pass,
         "duration_minutes": duration_minutes,
-        "created_at":       datetime.fromtimestamp(start_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "expires_at":       datetime.fromtimestamp(expire_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "created_at":       datetime.fromtimestamp(start_ts, tz=timezone(timedelta(hours=7))).strftime("%H:%M:%S %d/%m/%Y (GMT+7)"),
+        "expires_at":       datetime.fromtimestamp(expire_ts, tz=timezone(timedelta(hours=7))).strftime("%H:%M:%S %d/%m/%Y (GMT+7)"),
         "created_ts":       start_ts,
         "expires_ts":       expire_ts,
         "status":           "active"
@@ -229,12 +231,15 @@ async def connect_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='HTML')
         return ConversationHandler.END
 
-    user_id = update.effective_user.id
-    user_data[user_id] = {'_connect': True}
+    user_id  = update.effective_user.id
+    is_admin = (user_id == ADMIN_ID)
+    user_data[user_id] = {'_connect': True, '_is_admin': is_admin}
     await update.message.reply_text(
         "╔══════════════════════════╗\n"
         "║  🔌  KẾT NỐI MÁY TỪ XA  ║\n"
         "╚══════════════════════════╝\n\n"
+        + ("🔑 <b>Chế độ Admin</b> — Deploy bot\n\n" if is_admin else
+           "👤 <b>Chế độ thường</b> — Kiểm tra kết nối & chụp màn hình\n\n") +
         "📍 <b>Bước 1/3</b> — Nhập địa chỉ IP:",
         parse_mode='HTML')
     return REMOTE_IP_STATE
@@ -265,10 +270,11 @@ async def get_remote_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def get_remote_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    user_id  = update.effective_user.id
     password = update.message.text.strip()
     ip       = user_data[user_id]['remote_ip']
     username = user_data[user_id]['remote_username']
+    is_admin = user_data[user_id].get('_is_admin', False)
 
     msg = await update.message.reply_text(
         "🔄 Đang thiết lập kết nối, vui lòng chờ...")
@@ -293,16 +299,29 @@ async def get_remote_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'ip': ip, 'username': username, 'password': password, 'session': session
     }
 
-    await msg.edit_text(
-        "╔══════════════════════════════╗\n"
-        "║  ✅  KẾT NỐI THÀNH CÔNG!    ║\n"
-        "╚══════════════════════════════╝\n\n"
-        f"🖥️ IP       : <code>{ip}</code>\n"
-        f"👤 Username : <code>{username}</code>\n\n"
-        "🤖 Đang triển khai bot trên máy từ xa...",
-        parse_mode='HTML')
+    if is_admin:
+        # Admin: deploy bot như cũ
+        await msg.edit_text(
+            "╔══════════════════════════════╗\n"
+            "║  ✅  KẾT NỐI THÀNH CÔNG!    ║\n"
+            "╚══════════════════════════════╝\n\n"
+            f"🖥️ IP       : <code>{ip}</code>\n"
+            f"👤 Username : <code>{username}</code>\n\n"
+            "🤖 Đang triển khai bot trên máy từ xa...",
+            parse_mode='HTML')
+        asyncio.create_task(run_remote_bot_task(context.bot, user_id, session, username))
+    else:
+        # Người thường: chỉ chụp màn hình và gửi lại
+        await msg.edit_text(
+            "╔══════════════════════════════╗\n"
+            "║  ✅  KẾT NỐI THÀNH CÔNG!    ║\n"
+            "╚══════════════════════════════╝\n\n"
+            f"🖥️ IP       : <code>{ip}</code>\n"
+            f"👤 Username : <code>{username}</code>\n\n"
+            "📸 Đang chụp màn hình để kiểm tra...",
+            parse_mode='HTML')
+        asyncio.create_task(run_screenshot_task(context.bot, user_id, session))
 
-    asyncio.create_task(run_remote_bot_task(context.bot, user_id, session, username))
     user_data.pop(user_id, None)
     return ConversationHandler.END
 
@@ -343,6 +362,91 @@ async def run_remote_bot_task(bot, user_id: int, session, username: str):
         await bot.send_message(chat_id=user_id,
                                text=f"❌ Lỗi khi triển khai bot: <code>{e}</code>",
                                parse_mode='HTML')
+
+
+async def run_screenshot_task(bot, user_id: int, session):
+    """Chụp màn hình RDP và gửi cho người dùng (dành cho người thường)."""
+    loop = asyncio.get_running_loop()
+    try:
+        # Chạy lệnh PowerShell chụp màn hình và lưu vào file tạm
+        screenshot_cmd = (
+            "Add-Type -AssemblyName System.Windows.Forms; "
+            "$screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds; "
+            "$bmp = New-Object System.Drawing.Bitmap($screen.Width, $screen.Height); "
+            "$g = [System.Drawing.Graphics]::FromImage($bmp); "
+            "$g.CopyFromScreen($screen.Location, [System.Drawing.Point]::Empty, $screen.Size); "
+            "$path = \"$env:TEMP\\rdp_screenshot.png\"; "
+            "$bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png); "
+            "Write-Host $path"
+        )
+        r = await loop.run_in_executor(None, lambda:
+            session.run_ps(screenshot_cmd))
+
+        if r.status_code != 0:
+            await bot.send_message(
+                chat_id=user_id,
+                text=(
+                    "╔══════════════════════════════╗\n"
+                    "║  ✅  RDP ĐANG HOẠT ĐỘNG      ║\n"
+                    "╚══════════════════════════════╝\n\n"
+                    "✅ Kết nối WinRM thành công!\n"
+                    "⚠️ Không thể chụp màn hình (có thể màn hình chưa hiển thị).\n\n"
+                    "💡 RDP của bạn đang chạy bình thường."
+                ),
+                parse_mode='HTML')
+            return
+
+        # Đọc file ảnh từ máy từ xa qua WinRM
+        remote_path = r.std_out.decode(errors='replace').strip().splitlines()[-1].strip()
+        read_cmd = f"[Convert]::ToBase64String([IO.File]::ReadAllBytes('{remote_path}'))"
+        r2 = await loop.run_in_executor(None, lambda:
+            session.run_ps(read_cmd))
+
+        if r2.status_code != 0 or not r2.std_out:
+            await bot.send_message(
+                chat_id=user_id,
+                text=(
+                    "╔══════════════════════════════╗\n"
+                    "║  ✅  RDP ĐANG HOẠT ĐỘNG      ║\n"
+                    "╚══════════════════════════════╝\n\n"
+                    "✅ Kết nối thành công, RDP hoạt động tốt!\n"
+                    "⚠️ Không thể đọc ảnh chụp màn hình.\n\n"
+                    "💡 Bạn có thể kết nối RDP bình thường."
+                ),
+                parse_mode='HTML')
+            return
+
+        b64_data = r2.std_out.decode(errors='replace').strip()
+        img_bytes = base64.b64decode(b64_data)
+
+        await bot.send_photo(
+            chat_id=user_id,
+            photo=io.BytesIO(img_bytes),
+            caption=(
+                "╔══════════════════════════════╗\n"
+                "║  ✅  RDP ĐANG HOẠT ĐỘNG      ║\n"
+                "╚══════════════════════════════╝\n\n"
+                "📸 Màn hình hiện tại của máy ảo.\n"
+                "✅ Máy đang chạy bình thường!\n\n"
+                "💡 Dùng /check để xem thông tin chi tiết."
+            )
+        )
+
+    except Exception as e:
+        logger.error(f"Screenshot task error: {e}")
+        # Nếu lỗi chụp màn hình, vẫn thông báo kết nối thành công
+        await bot.send_message(
+            chat_id=user_id,
+            text=(
+                "╔══════════════════════════════╗\n"
+                "║  ✅  RDP ĐANG HOẠT ĐỘNG      ║\n"
+                "╚══════════════════════════════╝\n\n"
+                "✅ Kết nối WinRM thành công!\n"
+                f"⚠️ Không thể chụp màn hình: <code>{e}</code>\n\n"
+                "💡 Máy của bạn đang chạy bình thường."
+            ),
+            parse_mode='HTML'
+        )
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -431,8 +535,9 @@ def format_remaining(seconds: float) -> str:
 
 def format_datetime_vn(ts: float) -> str:
     """Định dạng timestamp sang giờ Việt Nam (UTC+7)."""
-    dt = datetime.fromtimestamp(ts + 7 * 3600, tz=timezone.utc)
-    return dt.strftime("%H:%M:%S %d/%m/%Y")
+    tz_vn = timezone(timedelta(hours=7))
+    dt = datetime.fromtimestamp(ts, tz=tz_vn)
+    return dt.strftime("%H:%M:%S %d/%m/%Y (GMT+7)")
 
 
 def create_progress_bar(percent: int, length: int = 12) -> str:
@@ -927,7 +1032,6 @@ async def create_rdp_background(update: Update, context: ContextTypes.DEFAULT_TY
         await context.bot.send_message(
             chat_id=user_id,
             text=(
-                "🔒 File workflow đã được xóa để bảo mật.\n\n"
                 "✨ <b>Chúc bạn sử dụng dịch vụ vui vẻ!</b>"
             ),
             parse_mode='HTML')
@@ -1479,4 +1583,3 @@ if __name__ == '__main__':
     except ImportError:
         os.system("pip install python-telegram-bot pynacl requests pywinrm")
     main()
-
